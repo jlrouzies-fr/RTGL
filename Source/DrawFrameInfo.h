@@ -512,6 +512,7 @@ namespace detail
             .skyColorDefault             = { 199 / 255.0f, 233 / 255.0f, 255 / 255.0f },
             .skyColorMultiplier          = 1000.0f,
             .skyColorSaturation          = 1.0f,
+            .skyLightingMultiplier       = 1.0f,
             .skyViewerPosition           = {},
             .pSkyCubemapTextureName      = nullptr,
             .skyCubemapRotationTransform = {},

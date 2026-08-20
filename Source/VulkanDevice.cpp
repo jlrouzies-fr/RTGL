@@ -343,6 +343,7 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         RG_SET_VEC3_A( gu->skyColorDefault, params.skyColorDefault.data );
         gu->skyColorMultiplier = std::max( 0.0f, params.skyColorMultiplier );
         gu->skyColorSaturation = std::max( 0.0f, params.skyColorSaturation );
+        gu->skyLightingMultiplier = std::max( 0.0f, params.skyLightingMultiplier );
 
         // Doom64-RT: sky-reach test for the directional light. See
         // traceSunReachesSky() in RaygenCommon.h.

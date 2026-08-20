@@ -986,6 +986,11 @@ typedef struct RgDrawFrameSkyParams
     // The result sky color is multiplied by this value.
     float           skyColorMultiplier;
     float           skyColorSaturation;
+    // Multiplies sky radiance used by indirect bounce rays only. The visible
+    // primary sky keeps skyColorMultiplier, allowing unsealed legacy maps to
+    // show their sky without treating every void leak as an environment lamp.
+    // Default: 1.
+    float           skyLightingMultiplier;
     // A point from which rays are traced while using RG_SKY_TYPE_RASTERIZED_GEOMETRY.
     RgFloat3D       skyViewerPosition;
     // If sky type is RG_SKY_TYPE_CUBEMAP, this cubemap is used.

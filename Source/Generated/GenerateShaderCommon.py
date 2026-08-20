@@ -619,6 +619,12 @@ GLOBAL_UNIFORM_STRUCT = [
     (TYPE_FLOAT32,      1,      "emissionMaxScreenColor",       1),
     (TYPE_FLOAT32,      1,      "normalMapStrength",            1),
     (TYPE_FLOAT32,      1,      "skyColorSaturation",           1),
+    (TYPE_FLOAT32,      1,      "skyLightingMultiplier",        1),
+    # Keep the scalar run aligned before the next std140 vec4/array. C packs
+    # these contiguously while GLSL rounds that boundary to 16 bytes.
+    (TYPE_FLOAT32,      1,      "_skyLightingPad0",              1),
+    (TYPE_FLOAT32,      1,      "_skyLightingPad1",              1),
+    (TYPE_FLOAT32,      1,      "_skyLightingPad2",              1),
 
     (TYPE_UINT32,       1,      "maxBounceShadowsLights",           1),
     (TYPE_FLOAT32,      1,      "rayLength",                        1),

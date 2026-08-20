@@ -324,7 +324,11 @@ vec3 getSkyAlbedo( vec3 direction )
 
 vec3 getSky( vec3 direction )
 {
-    return adjustSky( getSkyAlbedo( direction ) );
+    // Primary visibility uses adjustSky() directly in storeSky(). This helper
+    // is used only when an indirect bounce misses geometry, so legacy maps can
+    // retain a visible sky while declining unverified environment lighting.
+    return adjustSky( getSkyAlbedo( direction ) ) *
+           globalUniform.skyLightingMultiplier;
 }
 #endif
 

@@ -781,6 +781,7 @@ void MainLoop( RgInterface& rt, std::string_view gltfPath )
                 .skyColorDefault    = { 0.71f, 0.88f, 1.0f },
                 .skyColorMultiplier = ctl_SkyIntensity,
                 .skyColorSaturation = 1.0f,
+                .skyLightingMultiplier = 1.0f,
                 .skyViewerPosition  = { 0, 0, 0 },
             };
 #if 0
