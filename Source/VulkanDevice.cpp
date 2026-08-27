@@ -467,7 +467,11 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
 
         gu->maxBounceShadowsLights     = params.maxBounceShadows;
         gu->polyLightSpotlightFactor   = std::max( 0.0f, params.polygonalLightSpotlightFactor );
-        gu->indirSecondBounce          = !!params.enableSecondBounceForIndirect;
+        // [1,4], not the API's advertised 8: emissionMapBoost runs at 200 in
+        // this game and emis * 200 * albedo^k compounding over depth is a
+        // firefly risk. Widen after measurement, not before.
+        gu->indirectBounces      = std::clamp( params.indirectBounces, 1u, 4u );
+        gu->indirectLegacyWeight = !!params.indirectLegacyBounceWeight;
         gu->lightIndexIgnoreFPVShadows = lightManager->GetLightIndexForShaders(
             currentFrameState.GetFrameIndex(), params.lightUniqueIdIgnoreFirstPersonViewerShadows );
         gu->cellWorldSize       = std::max( params.cellWorldSize, 0.001f );
@@ -538,7 +542,24 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
                     params.stylizedLiquidCrest[ i ].data,
                     3 * sizeof( float ) );
             gu->stylizedLiquidCrest[ i * 4 + 3 ] = 0.0f;
+
+            // These two are ONE vec4 each, holding a scalar per liquid -- not
+            // four vec4s. Indexed in the shader as stylizedLiquidRelief[id].
+            gu->stylizedLiquidRelief[ i ] =
+                std::clamp( params.stylizedLiquidRelief[ i ], 0.0f, 1.0f );
+            gu->stylizedLiquidFlow[ i ] = std::max( 0.0f, params.stylizedLiquidFlow[ i ] );
+            gu->stylizedLiquidCaustics[ i ] =
+                std::max( 0.0f, params.stylizedLiquidCaustics[ i ] );
+            gu->stylizedLiquidRefl[ i ] = std::max( 0.0f, params.stylizedLiquidRefl[ i ] );
+            // NOT clamped up from 0: <= 0 is the "use the global" sentinel.
+            gu->stylizedLiquidRough[ i ] =
+                std::min( params.stylizedLiquidRough[ i ], 1.0f );
         }
+        gu->liquidNoSplit   = params.liquidNoSplit != 0.0f ? 1.0f : 0.0f;
+        gu->liquidFlowSpeed = params.liquidFlowSpeed;
+        gu->liquidFlowScale  = std::max( 0.01f, params.liquidFlowScale );
+        gu->liquidFlowAspect = std::max( 0.1f, params.liquidFlowAspect );
+        gu->liquidFlowDebug = params.liquidFlowDebug;
         gu->lavaEmisBoost          = std::max( 0.0f, params.lavaEmisBoost );
         gu->lavaFlowStrength       = std::clamp( params.lavaFlowStrength, 0.0f, 1.0f );
         gu->lavaFlowSpeed          = params.lavaFlowSpeed;
@@ -548,6 +569,7 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         gu->lavaPulseSpeed         = params.lavaPulseSpeed;
         gu->lavaGiBoost            = std::max( 0.0f, params.lavaGiBoost );
         gu->lavaDebug              = std::max( 0.0f, params.lavaDebug );
+
         memcpy( gu->lavaTint, params.lavaTint.data, 3 * sizeof( float ) );
         gu->lavaTint[ 3 ] = 0.0f;
         gu->stylizedWaterDebug     = std::max( 0.0f, params.stylizedWaterDebug );
@@ -974,6 +996,92 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         gu->volumeShaftRelCull = std::clamp( params.relativeCull, 0.0f, 1.0f );
     }
 
+    // Doom64-RT: VOLUMETRIC CLOUDS. See RgDrawFrameVolumetricCloudParams and
+    // Shaders/Clouds.h for the packing. A frame that never links the struct
+    // lands on enabled=0, and then nothing here is read by any shader.
+    {
+        const auto& p = pnext::get< RgDrawFrameVolumetricCloudParams >( drawInfo );
+
+        const bool on = p.enabled && p.thickness > 0.0f && p.density > 0.0f;
+
+        gu->cloudParams0[ 0 ] = on ? 1.0f : 0.0f;
+        gu->cloudParams0[ 1 ] = std::max( p.altitude, 1.0f );
+        gu->cloudParams0[ 2 ] = std::max( p.thickness, 1.0f );
+        gu->cloudParams0[ 3 ] = std::clamp( p.coverage, 0.0f, 1.0f );
+
+        gu->cloudParams1[ 0 ] = std::max( p.density, 0.0f );
+        gu->cloudParams1[ 1 ] = 1.0f / std::max( p.featureSize, 1.0f );
+        gu->cloudParams1[ 2 ] = std::clamp( p.detail, 0.0f, 1.0f );
+        gu->cloudParams1[ 3 ] = p.time;
+
+        gu->cloudParams2[ 0 ] = float( std::clamp( p.steps, 4u, 128u ) );
+        gu->cloudParams2[ 1 ] = float( std::clamp( p.lightSteps, 1u, 16u ) );
+        gu->cloudParams2[ 2 ] = std::max( p.horizonFade, 0.01f );
+        gu->cloudParams2[ 3 ] = std::clamp( p.historyBlend, 0.0f, 0.97f );
+
+        gu->cloudParams3[ 0 ] = std::clamp( p.transmitFloor, 0.0f, 1.0f );
+        gu->cloudParams3[ 1 ] = std::clamp( p.asymmetry, -0.95f, 0.95f );
+        gu->cloudParams3[ 2 ] = float( std::min( p.debugMode, 3u ) );
+        gu->cloudParams3[ 3 ] = p.wind.data[ 0 ];
+
+        gu->cloudTint[ 0 ] = std::max( p.tint.data[ 0 ], 0.0f );
+        gu->cloudTint[ 1 ] = std::max( p.tint.data[ 1 ], 0.0f );
+        gu->cloudTint[ 2 ] = std::max( p.tint.data[ 2 ], 0.0f );
+        gu->cloudTint[ 3 ] = p.wind.data[ 1 ];
+
+        // Normalised here, once; a zero vector becomes "straight up" rather
+        // than NaN in every texel.
+        {
+            float d[ 3 ] = { p.lightDir.data[ 0 ], p.lightDir.data[ 1 ], p.lightDir.data[ 2 ] };
+            float len    = std::sqrt( d[ 0 ] * d[ 0 ] + d[ 1 ] * d[ 1 ] + d[ 2 ] * d[ 2 ] );
+            if( len < 1e-6f )
+            {
+                d[ 0 ] = 0.0f;
+                d[ 1 ] = 1.0f;
+                d[ 2 ] = 0.0f;
+                len    = 1.0f;
+            }
+            gu->cloudLightDir[ 0 ] = d[ 0 ] / len;
+            gu->cloudLightDir[ 1 ] = d[ 1 ] / len;
+            gu->cloudLightDir[ 2 ] = d[ 2 ] / len;
+            gu->cloudLightDir[ 3 ] = std::max( p.underStrength, 0.0f );
+        }
+
+        for( int c = 0; c < 3; c++ )
+        {
+            gu->cloudLightColor[ c ] = std::max( p.lightColor.data[ c ], 0.0f );
+            gu->cloudUnderColor[ c ] = std::max( p.underColor.data[ c ], 0.0f );
+            gu->cloudAmbient[ c ]    = std::max( p.ambient.data[ c ], 0.0f );
+        }
+        // The spare .w lanes carry the directional-light occlusion (Light.h):
+        // lightColor.w = transmit of an opaque column, underColor.w = on/off,
+        // ambient.w = how much of the occlusion to apply.
+        gu->cloudLightColor[ 3 ] = std::clamp( p.lightTransmit, 0.0f, 1.0f );
+        gu->cloudUnderColor[ 3 ] = ( on && p.sunOcclusion ) ? 1.0f : 0.0f;
+        gu->cloudAmbient[ 3 ]    = std::clamp( p.lightOcclude, 0.0f, 1.0f );
+        for( int c = 0; c < 3; c++ )
+        {
+            gu->cloudBackColor[ c ] = std::max( p.backColor.data[ c ], 0.0f );
+        }
+        gu->cloudBackColor[ 3 ] = std::max( p.backStrength, 0.0f );
+        gu->cloudFireParams[ 0 ] = std::max( p.fireStrength, 0.0f );
+        gu->cloudFireParams[ 1 ] = 1.0f / std::max( p.fireScale, 1.0f );
+        gu->cloudFireParams[ 2 ] = 1.0f - std::clamp( p.fireCover, 0.0f, 1.0f );
+        gu->cloudFireParams[ 3 ] = std::max( p.fireLit, 0.0f );
+        gu->cloudLayerParams[ 0 ] = p.layers >= 2 ? 2.0f : 1.0f;
+        gu->cloudLayerParams[ 1 ] = std::clamp( p.gapFraction, 0.02f, 0.8f );
+        gu->cloudLayerParams[ 2 ] = std::max( p.sheetExtinction, 0.0f );
+        gu->cloudLayerParams[ 3 ] = 0.0f;
+        gu->cloudFireAnim[ 0 ] = std::clamp( p.firePulse, 0.0f, 1.0f );
+        gu->cloudFireAnim[ 1 ] = std::max( p.firePulseSpeed, 0.0f );
+        gu->cloudFireAnim[ 2 ] = std::clamp( p.fireFlicker, 0.0f, 1.0f );
+        gu->cloudFireAnim[ 3 ] = 1.0f / std::max( p.cascadeWidth, 1.0f );
+        gu->cloudCascade[ 0 ]  = std::max( p.cascadeStrength, 0.0f );
+        gu->cloudCascade[ 1 ]  = 1.0f / std::max( p.cascadeLength, 1.0f );
+        gu->cloudCascade[ 2 ]  = 1.0f - std::clamp( p.cascadeCover, 0.0f, 1.0f );
+        gu->cloudCascade[ 3 ]  = p.cascadeSpeed;
+    }
+
     gu->antiFireflyEnabled = devmode ? devmode->antiFirefly : true;
 
     {
@@ -988,7 +1096,8 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         gu->rrFireflyMinLum    = std::max( illum.rrFireflyMinLum, 0.0f );
         gu->restirBlueNoise    = !!illum.restirBlueNoise;
         gu->shadowSamples      = std::clamp( illum.shadowSamples, 1u, 8u );
-        gu->debugRestirM       = !!illum.debugRestirM;
+        // 1 = direct reservoir M, 2 = indirect reservoir M. Not a bool.
+        gu->debugRestirM       = std::min( illum.debugRestirM, 2u );
         gu->debugVisibility    = std::min( illum.debugVisibility, 2u );
 
         // Doom64-RT: make debugVisibility 1 self-sufficient, because it was NOT, and that
@@ -1017,6 +1126,7 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         {
             gu->debugShowFlags |= DEBUG_SHOW_FLAG_UNFILTERED_DIFFUSE;
         }
+        gu->debugShowFlags |= illum.debugShowFlags;
         gu->restirTemporalJitter = std::clamp( illum.restirTemporalJitter, 0.0f, 8.0f );
         gu->rrSpecHitDist      = !!illum.rrSpecularHitDistance;
 
@@ -1041,6 +1151,10 @@ void RTGL1::VulkanDevice::FillUniform( RTGL1::ShGlobalUniform* gu,
         gu->nrdValidation = !!illum.nrdValidation;
         gu->rrDemod       = !!illum.rrDemod;
         gu->rrDemodFilter = std::min( illum.rrDemodFilter, 2u );
+        gu->svgfFp        = std::min( illum.svgfFp, 2u );
+        gu->svgfFpGrad    = !!illum.svgfFpGrad;
+        gu->svgfIndirMaxHist = std::clamp( illum.svgfIndirMaxHist, 0.0f, 256.0f );
+        gu->svgfIndirAntilag = !!illum.svgfIndirAntilag;
 
         gu->directSamples         = std::clamp( illum.directSamples, 1u, 8u );
         gu->indirectSamples       = std::clamp( illum.indirectSamples, 1u, 8u );
@@ -1172,11 +1286,19 @@ auto RTGL1::VulkanDevice::Render( VkCommandBuffer& cmd, const RgDrawFrameInfo& d
         // draw rasterized sky to albedo before tracing primary rays
         if( uniform->GetData()->skyType == RG_SKY_TYPE_RASTERIZED_GEOMETRY )
         {
-            rasterizer->DrawSkyToCubemap( cmd, frameIndex, *textureManager, *uniform );
+            // Doom64-RT: the volumetric cloud map, marched once, read by both
+            // sky passes below.
+            volumetric->ProcessClouds( cmd, frameIndex, *uniform, *blueNoise );
+
+            rasterizer->DrawSkyToCubemap(
+                cmd, frameIndex, *textureManager, *uniform, *tonemapping, *volumetric );
             rasterizer->DrawSkyToAlbedo(
                 cmd,
                 frameIndex,
                 *textureManager,
+                *uniform,
+                *tonemapping,
+                *volumetric,
                 cameraInfo.view,
                 pnext::get< RgDrawFrameSkyParams >( drawInfo ).skyViewerPosition,
                 cameraInfo.projection,
@@ -1309,19 +1431,29 @@ auto RTGL1::VulkanDevice::Render( VkCommandBuffer& cmd, const RgDrawFrameInfo& d
             // would leave the default path with no way to verify its own uniforms.
             {
                 static bool     s_rHave = false;
-                static uint32_t s_rPrev[ 2 ] = {};
+                static uint32_t s_rPrev[ 4 ] = {};
                 const uint32_t  init = uniform->GetData()->restirInitialSamples;
                 const uint32_t  spat = uniform->GetData()->restirSpatialSamples;
-                if( !s_rHave || s_rPrev[ 0 ] != init || s_rPrev[ 1 ] != spat )
+                // GI depth and the shadow depth it needs are part of the
+                // trigger: an arm that moves only rt_gi_bounces must still
+                // get its one printed proof that the value reached the shader.
+                const uint32_t  gib  = uniform->GetData()->indirectBounces;
+                const uint32_t  shd  = uniform->GetData()->maxBounceShadowsLights;
+                if( !s_rHave || s_rPrev[ 0 ] != init || s_rPrev[ 1 ] != spat ||
+                    s_rPrev[ 2 ] != gib || s_rPrev[ 3 ] != shd )
                 {
                     s_rHave      = true;
                     s_rPrev[ 0 ] = init;
                     s_rPrev[ 1 ] = spat;
+                    s_rPrev[ 2 ] = gib;
+                    s_rPrev[ 3 ] = shd;
                     debug::Warning( "ReSTIR: initialSamples={} (stock 8), "
                                     "spatialSamples={} (stock 8), spatialRadius={} "
                                     "(stock 30), temporalMCap={} (stock 20), "
                                     "temporalJitter={} (stock 2), shadowSamples={} "
-                                    "(stock 1), sppDirect={}, sppIndirect={}",
+                                    "(stock 1), sppDirect={}, sppIndirect={}, "
+                                    "giBounces={} (stock 2), giLegacyWeight={} (stock 1), "
+                                    "maxBounceShadows={} (vertex i lit iff i < this)",
                                     init,
                                     spat,
                                     uniform->GetData()->restirSpatialRadius,
@@ -1329,7 +1461,10 @@ auto RTGL1::VulkanDevice::Render( VkCommandBuffer& cmd, const RgDrawFrameInfo& d
                                     uniform->GetData()->restirTemporalJitter,
                                     uniform->GetData()->shadowSamples,
                                     uniform->GetData()->directSamples,
-                                    uniform->GetData()->indirectSamples );
+                                    uniform->GetData()->indirectSamples,
+                                    gib,
+                                    uniform->GetData()->indirectLegacyWeight,
+                                    shd );
                 }
             }
 

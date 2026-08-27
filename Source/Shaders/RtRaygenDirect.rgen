@@ -30,6 +30,8 @@
 #define DESC_SET_VERTEX_DATA 3
 #define DESC_SET_TEXTURES 4
 #define DESC_SET_RANDOM 5
+// Doom64-RT: the volumetric set (cloud map), for cloudSunAttenuation in Light.h.
+#define DESC_SET_VOLUMETRIC 11
 #define DESC_SET_LIGHT_SOURCES 6
 #define LIGHT_SAMPLE_METHOD (LIGHT_SAMPLE_METHOD_DIRECT)
 #include "RaygenCommon.h"
@@ -68,7 +70,8 @@ void main()
     // denoiser tuning can fix, because it is upstream of every denoiser.
     // Green ramp = M/32: black is M=1 (worst case, one sample), bright green is
     // a well-accumulated reservoir. Watch it while standing still, then move.
-    if (globalUniform.debugRestirM != 0)
+    // 1 = this, the direct reservoir. 2 = the indirect one (RtRaygenIndirect.inl).
+    if (globalUniform.debugRestirM == 1)
     {
         float mNorm = clamp(float(r.M) / 32.0, 0.0, 1.0);
         imageStoreUnfilteredDirect(pix, vec3(mNorm * 0.15, mNorm, mNorm * 0.15));

@@ -48,6 +48,8 @@
 #define DESC_SET_VERTEX_DATA 3
 #define DESC_SET_TEXTURES 4
 #define DESC_SET_RANDOM 5
+// Doom64-RT: the volumetric set (cloud map), for cloudSunAttenuation in Light.h.
+#define DESC_SET_VOLUMETRIC 11
 #define DESC_SET_LIGHT_SOURCES 6
 #define DESC_SET_CUBEMAPS 7
 #define DESC_SET_RENDER_CUBEMAP 8
@@ -241,6 +243,7 @@ vec3 getStylizedWaterAlbedo( const vec3  texAlbedo,
                              const vec3  waveNormal,
                              const vec3  baseNormal,
                              const uint  liquidId,
+                             const float flow,
                              out   float caustic )
 {
     // the veins ARE the caustics in the source art: normalize the flat's
@@ -254,8 +257,29 @@ vec3 getStylizedWaterAlbedo( const vec3  texAlbedo,
     float tilt    = clamp( length( waveNormal - baseNormal ) * 3.0, 0.0, 1.0 );
     float shimmer = tilt * tilt;
 
-    // veins keep their shape, but breathe with the waves
-    caustic = clamp( veins * ( 1.0 + globalUniform.stylizedWaterCaustic * shimmer ), 0.0, 1.0 );
+    // Doom64-RT: the flow. `flow` is a detail texture ADVECTED along the vein
+    // direction in the primary pass (HitInfo.inl), 0..1 centred on 0.5, and
+    // exactly 0 where the texel carries no flow. It modulates the vein
+    // brightness both ways, so blobs of brighter and darker liquid slide down
+    // each channel -- texture moving, not brightness pulsing in place.
+    const float flowAmt = globalUniform.stylizedLiquidFlow[ liquidId ];
+    float       flowMod = 0.0;
+    if( flowAmt > 0.0 && flow > 0.0 )
+    {
+        flowMod = flowAmt * ( flow * 2.0 - 1.0 );
+    }
+
+    // veins keep their shape, but breathe with the waves -- except where the
+    // material relief has replaced the waves. At relief 1 the wave normal IS
+    // the surface normal, so tilt and shimmer are identically zero and
+    // stylizedWaterCaustic would be a silent no-op; fading it out against
+    // relief says so, and hands the animation to the flow instead.
+    const float relief = globalUniform.stylizedLiquidRelief[ liquidId ];
+    caustic = clamp( veins * ( 1.0 +
+                               globalUniform.stylizedWaterCaustic * shimmer * ( 1.0 - relief ) +
+                               flowMod ),
+                     0.0,
+                     1.0 );
 
     const vec3 body  = globalUniform.stylizedLiquidTint[ liquidId ].rgb;
     const vec3 crest = mix( body, getLiquidCrestColor( liquidId ), 0.85 );
@@ -366,8 +390,17 @@ float getLavaHeat( const vec3 position )
 int probeWaterBelow( const vec3  position,
                      const vec3  normal,
                      out   vec3  waterPos,   // world-space point on the water that was hit
-                     out   float waterDist ) // receiver -> water distance, metres
+                     out   float waterDist,  // receiver -> water distance, metres
+                     // Doom64-RT: WHICH liquid was found. A caustic is light
+                     // refracted THROUGH a fluid and focused on what is under
+                     // it, so an opaque one cannot make any: blood was throwing
+                     // swimming-pool light onto the walls around it. The probe
+                     // is receiver-side and the receiver has no idea what it is
+                     // standing near, so the id has to come back out of here --
+                     // and it is free, the flags are already unpacked below.
+                     out   uint  liquidId )
 {
+    liquidId = 0;
     const vec3 up     = globalUniform.worldUpVector.xyz;
     const vec3 origin = position + normal * 0.05;
 
@@ -427,6 +460,8 @@ int probeWaterBelow( const vec3  position,
     {
         return WATERPROBE_OTHER;
     }
+
+    liquidId = getLiquidId( geometryInstances[ instanceId ].flags );
 
     // Resolve the exact point on the water. The caustic pattern lives on the
     // WATER surface, so it has to be sampled there and not at the receiver:
@@ -687,6 +722,7 @@ void main()
     float firstHitDepthNDC;
     float firstHitDepthLinear;
     vec3  screenEmission;
+    float liquidFlow;
     const ShHitInfo h = getHitInfoPrimaryRay( primaryPayload,
                                               cameraOrigin,
                                               cameraRayDir,
@@ -697,7 +733,8 @@ void main()
                                               gradDepth,
                                               firstHitDepthNDC,
                                               firstHitDepthLinear,
-                                              screenEmission );
+                                              screenEmission,
+                                              liquidFlow );
 
     if( tryAsFluid( pix, regularPix, cameraRayDir, firstHitDepthNDC ) )
     {
@@ -717,6 +754,8 @@ void main()
     {
         vec3  waterPos;
         float waterDist;
+        // initialised here too: the probe only writes it when `receives` is true
+        uint  probeLiquid = 0;
 
         // Sprites do not receive caustics. A caustic is light thrown ACROSS a
         // surface; a camera-facing billboard has no surface for it to lie on,
@@ -725,8 +764,9 @@ void main()
         const bool receives =
             ( h.geometryInstanceFlags & GEOM_INST_FLAG_NO_WATER_CAUSTICS ) == 0;
 
-        const int probe = receives ? probeWaterBelow( h.hitPosition, h.normal, waterPos, waterDist )
-                                   : WATERPROBE_MISS;
+        const int probe =
+            receives ? probeWaterBelow( h.hitPosition, h.normal, waterPos, waterDist, probeLiquid )
+                     : WATERPROBE_MISS;
 
         // Two separate falloffs, because they are not the same distance.
         //  - along the probe: light spreads, so a wall at the pool edge gets a
@@ -741,8 +781,17 @@ void main()
         const float fadeH =
             1.0 - clamp( max( 0.0, up_h ) / max( 0.001, globalUniform.waterCausticRise ), 0.0, 1.0 );
 
+        // Doom64-RT: per-liquid. A caustic is light refracted through a fluid
+        // and focused on the surface beyond it, so how much a liquid throws is
+        // a property OF that liquid -- and an opaque one throws none. Blood was
+        // casting the same rippling pool-light on the surrounding walls as
+        // water, which is the single loudest thing saying "this is water with
+        // red paint on it".
+        const float liquidCaustics = globalUniform.stylizedLiquidCaustics[ probeLiquid ];
+
         const float caustic = ( probe == WATERPROBE_WATER )
-                                  ? getWaterCaustic( waterPos ) * fadeD * fadeH * fadeH
+                                  ? getWaterCaustic( waterPos ) * fadeD * fadeH * fadeH *
+                                        liquidCaustics
                                   : 0.0;
 
         if( globalUniform.stylizedWaterDebug > 0.0 )
@@ -793,7 +842,13 @@ void main()
     }
 
     imageStore(framebufIsSky,               pix, ivec4(0));
-    imageStore(framebufAlbedo,              getRegularPixFromCheckerboardPix(pix), vec4(primaryAlbedo, 0.0));
+    // Doom64-RT: the alpha channel carries the liquid flow detail across to the
+    // refl/refr pass, which is where the stylized liquid surface is shaded and
+    // which cannot sample a material texture for itself. framebufAlbedo.a is
+    // free for this: every other store site writes 0 there and every reader --
+    // Surface.inl, CmNoisyCompose, CmNrdCompose, CmNrdPack, CmSVGFAtrous, the
+    // Ef* passes -- takes .rgb.
+    imageStore(framebufAlbedo,              getRegularPixFromCheckerboardPix(pix), vec4(primaryAlbedo, liquidFlow));
     imageStore(framebufScreenEmisRT,        getRegularPixFromCheckerboardPix(pix), vec4(primaryEmission * throughput , 0.0));
     imageStoreNormal(                       pix, h.normal);
     imageStore(framebufMetallicRoughness,   pix, vec4(h.metallic, h.roughness, 0, 0));
@@ -843,7 +898,12 @@ void main()
     // restore state from primary shader
     const uvec3 primaryToReflRefrBuf        = texelFetch(framebufPrimaryToReflRefr_Sampler, pix, 0).rgb;
     ShHitInfo h;
-    h.albedo                                = texelFetch(framebufAlbedo_Sampler, getRegularPixFromCheckerboardPix(pix), 0).rgb;
+    const vec4  albedoAndPhase              = texelFetch(framebufAlbedo_Sampler, getRegularPixFromCheckerboardPix(pix), 0);
+    h.albedo                                = albedoAndPhase.rgb;
+    // Doom64-RT: the liquid flow detail the primary pass advected along the
+    // height map's baked direction. See the store site for why it travels in
+    // the alpha channel.
+    const float liquidFlow                  = albedoAndPhase.a;
     h.hitPosition                           = texelFetch(framebufSurfacePosition_Sampler, pix, 0).xyz;
     h.geometryInstanceFlags                 = primaryToReflRefrBuf.r;
     h.portalIndex                           = primaryToReflRefrBuf.b;
@@ -949,6 +1009,11 @@ void main()
         bool  doRefraction;
         vec3  refractionDir;
         float F;
+        // Doom64-RT: the normal this surface is actually SHADED and REFLECTED
+        // with. Identical to `normal` everywhere except a stylized liquid that
+        // has been given its material relief back, so every other path is
+        // bit-for-bit unchanged.
+        vec3  shadeNormal = normal;
 
         if( stylizedWater )
         {
@@ -963,6 +1028,26 @@ void main()
             // reflective at grazing angles.
             doRefraction = false;
 
+            // Doom64-RT: give the material normal back.
+            //
+            // getNormal() replaced the normal-mapped normal with the animated
+            // water wave, because it takes the wave branch for any water
+            // surface whose hasNormalMap is false -- and at the primary hit that
+            // flag is hardcoded false (it is only ever assigned for a LATER
+            // bounce). So an _n map on a liquid is sampled by the primary pass,
+            // written to the G-buffer, and then thrown away here. h.normal still
+            // holds it, which is what makes this recoverable at all.
+            //
+            // relief 0 = the wave, untouched, which is what water and nukage
+            // use -- nukage on purpose: poison has no authored _n to give back.
+            // 1 = the authored relief alone: a still surface with real ridges,
+            // which is what a coagulated blood pool is and what a ripple can
+            // never be. Blood and sludge both ship at 1.
+            const uint  d64_liquidId = getLiquidId( h.geometryInstanceFlags );
+            const float d64_relief   = globalUniform.stylizedLiquidRelief[ d64_liquidId ];
+            const vec3  d64_matN     = isBackface( h.normal, rayDir ) ? -h.normal : h.normal;
+            shadeNormal              = normalize( mix( normal, d64_matN, d64_relief ) );
+
             // NOT physical Fresnel. Water's F0 is ~0.02, so a correct Schlick
             // term makes the reflection invisible from anywhere but a grazing
             // angle -- which is exactly why the first version looked like it
@@ -970,27 +1055,60 @@ void main()
             // (weak head-on, strong at grazing) but remap its range onto
             // [reflMin, reflMax] so the surface reads as reflective from above.
             {
-                const float cosTheta = clamp( dot( normal, -normalize( rayDir ) ), 0.0, 1.0 );
+                const float cosTheta = clamp( dot( shadeNormal, -normalize( rayDir ) ), 0.0, 1.0 );
                 const float curve    = pow( 1.0 - cosTheta, 5.0 );
                 F                    = mix( globalUniform.stylizedWaterReflMin,
                                             globalUniform.stylizedWaterReflMax,
                                             curve );
+                // Doom64-RT: per-liquid reflection. A mirror is what sells
+                // WATER; on an opaque mud bed it is the single loudest thing
+                // saying "this is water with brown paint on it". Scaling F
+                // here does both halves of the checkerboard at once -- the
+                // even pixels' mirror ray is weighted by F and the odd
+                // pixels' surface by (1 - F) -- so the light the surface
+                // loses to the reflection comes straight back to the diffuse
+                // shading instead of vanishing.
+                F *= globalUniform.stylizedLiquidRefl[ d64_liquidId ];
                 F                    = clamp( F, 0.0, 1.0 );
             }
 
-            if( isPixOdd )
+            // Doom64-RT: an OPAQUE BED does not split. stylizedLiquidRefl 0
+            // means "no mirror at all": the surface is shaded on EVERY pixel,
+            // full resolution, no checkerboard, and its wet sheen comes from
+            // the standard glossy specular off the roughness written below --
+            // the lighter, dedicated reflection a mud bed wants.
+            //
+            // This is also a fix, not only a look. The split shades the lit
+            // surface on odd screen columns only and rebuilds the even ones as
+            // a 4-neighbour average, and the denoiser reprojects history in
+            // that half-resolution space. Stock water has a smooth wave normal
+            // and never noticed. On a high-contrast authored normal, every
+            // texel alternates between "shaded" and "averaged from its
+            // neighbours" as it crosses columns while the camera moves: a
+            // per-texel contrast pulse that scales with slope amplitude,
+            // survives the denoiser, ignores parallax and the upscaler, and
+            // freezes into a stable pattern the moment the camera stops.
+            // Which is exactly the flashlight bug, and every bisect arm
+            // (nomaps clean, softnormal halved, flat and nodlss unchanged,
+            // visible in denoised direct diffuse) agrees with it.
+            // liquidNoSplit is the Options > Quality "Liquid surfaces" item: it
+            // takes every liquid down this path, water's mirror included.
+            const bool d64_noSplit = globalUniform.liquidNoSplit > 0.5 ||
+                                     globalUniform.stylizedLiquidRefl[ d64_liquidId ] <= 0.0;
+
+            if( isPixOdd || d64_noSplit )
             {
                 float caustic;
                 // the base normal must be the one getNormal() actually built
                 // the waves around, or the wave-tilt term reads ~2 everywhere
-                const vec3 baseNormal =
-                    isBackface( h.normal, rayDir ) ? -h.normal : h.normal;
-                const uint liquidId = getLiquidId( h.geometryInstanceFlags );
-                const vec3 surfAlbedo =
-                    getStylizedWaterAlbedo( h.albedo, normal, baseNormal, liquidId, caustic );
+                const vec3 baseNormal = d64_matN;
+                const uint liquidId   = d64_liquidId;
+                const vec3 surfAlbedo = getStylizedWaterAlbedo(
+                    h.albedo, normal, baseNormal, liquidId, liquidFlow, caustic );
 
-                // *2 compensates the split: this half covers two pixels
-                throughput *= ( 1.0 - F ) * 2.0;
+                // *2 compensates the split: this half covers two pixels.
+                // No split, no compensation and nothing given to a mirror.
+                throughput *= d64_noSplit ? 1.0 : ( 1.0 - F ) * 2.0;
 
                 // a little unlit sheen so the caustic pattern still reads in
                 // rooms the path tracer leaves nearly black (the original flat
@@ -1003,14 +1121,75 @@ void main()
                 // Keep position / depth / motion / visibility from the primary
                 // pass -- they already describe this exact surface. Only the
                 // shading inputs change.
+                // rt_blood_flow_debug: paint the ADVECTED DETAIL, so "the bake
+                // and the plumbing worked" is separable from "the motion is too
+                // subtle to see" -- by eye those are the same picture. Green
+                // blobs sliding along the veins = the flow map is live. Flat
+                // blue = the direction never reached the shader, or the detail
+                // never crossed framebufAlbedo.a; either way, tuning cannot help.
+                if( globalUniform.liquidFlowDebug > 0.5 )
+                {
+                    // Instrumented after the advection measured DEAD STATIC in a
+                    // burst capture while every plumbing stage checked out:
+                    //   RED   = fract(time/4)  -- must visibly change second to
+                    //           second, or the time uniform itself is frozen
+                    //   GREEN = the advected detail (the actual flow debug)
+                    //   BLUE  = the speed the shader sees, /50 -- near-black at
+                    //           the shipping 0.3, saturated if a test "60" pin
+                    //           arrives. Tells "speed never arrived" from "time
+                    //           is dead" in one frame-pair.
+                    const float timeBeat = fract( globalUniform.time * 0.25 );
+                    const float speedTint =
+                        clamp( globalUniform.liquidFlowSpeed * 0.02, 0.0, 1.0 );
+                    imageStore( framebufAlbedo, regPix, vec4( 0.0 ) );
+                    imageStore( framebufScreenEmisRT,
+                                regPix,
+                                liquidFlow > 0.0
+                                    ? vec4( timeBeat, liquidFlow, speedTint, 0.0 )
+                                    : vec4( timeBeat, 0.0, 0.15 + speedTint, 0.0 ) );
+                    imageStoreNormal( pix, shadeNormal );
+                    imageStore( framebufThroughput, pix, vec4( vec3( 1.0 ), -1.0 ) );
+                    imageStore( framebufReactivity, regPix, vec4( UPSCALER_REACTIVITY_REFLREFR ) );
+                    return;
+                }
+
                 imageStore( framebufAlbedo, regPix, vec4( surfAlbedo, 0.0 ) );
                 imageStore( framebufScreenEmisRT, regPix, vec4( screenEmission + sheen, 0.0 ) );
-                imageStoreNormal( pix, normal );
-                imageStore( framebufMetallicRoughness,
-                            pix,
-                            vec4( 0.0, globalUniform.stylizedWaterRoughness, 0, 0 ) );
+                imageStoreNormal( pix, shadeNormal );
+                // Per-liquid roughness, <= 0 meaning "keep the global". The
+                // reflection RAY is a mirror off shadeNormal regardless; this
+                // is what the denoiser and any later bounce see, and it is
+                // what stops a rough liquid being resolved as a sharp one.
+                const float d64_rough = globalUniform.stylizedLiquidRough[ liquidId ] > 0.0
+                                            ? globalUniform.stylizedLiquidRough[ liquidId ]
+                                            : globalUniform.stylizedWaterRoughness;
+                imageStore( framebufMetallicRoughness, pix, vec4( 0.0, d64_rough, 0, 0 ) );
                 // alpha == 1: was refl/refr WITH a split -> resolve checkerboard
-                imageStore( framebufThroughput, pix, vec4( throughput, 1.0 ) );
+                // alpha == -1: no split -> CmCheckerboard leaves the pixel alone
+                imageStore( framebufThroughput, pix, vec4( throughput, d64_noSplit ? -1.0 : 1.0 ) );
+                // Doom64-RT: THE FIX. Every other exit from this shader marks
+                // its reactivity (see storeSky and the hitInfoWasOverwritten
+                // path at the bottom of this file); this early return was the
+                // one place that did not, and it is exactly the return this
+                // liquid surface always takes. Unmarked reads as "static,
+                // trust history" to DLSS's temporal upscaler, which is active
+                // in every configuration this was tested under (DLSS2 Super
+                // Resolution, independent of A-SVGF handling the denoise) --
+                // so a flow signal that changes COLOUR ONLY, with a static
+                // normal (relief pins it) and zero motion vector, gets
+                // averaged toward its time-mean before it reaches the screen.
+                // That average is a brighter, static crest: exactly the
+                // symptom reported, on both the phase-pulse and the flow-map
+                // versions, because neither ever set this.
+                //
+                // With no split and no flow this is an ordinary static opaque
+                // surface, and telling the upscaler to distrust its history
+                // would only cost it anti-aliasing. Mark it like one.
+                const bool d64_plainOpaque =
+                    d64_noSplit && globalUniform.stylizedLiquidFlow[ liquidId ] <= 0.0;
+                imageStore( framebufReactivity,
+                            regPix,
+                            vec4( d64_plainOpaque ? 0.0 : UPSCALER_REACTIVITY_REFLREFR ) );
                 return;
             }
 
@@ -1083,7 +1262,7 @@ void main()
         }
         else
         {
-            rayDir = reflect( normalize( rayDir ), normal );
+            rayDir = reflect( normalize( rayDir ), shadeNormal );
 
             if( !isWater )
             {

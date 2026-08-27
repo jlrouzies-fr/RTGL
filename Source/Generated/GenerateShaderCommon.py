@@ -273,6 +273,13 @@ CONST = {
     # together, not just the top-level ILLUMINATION_VOLUME flag (2026-08-08).
     "BINDING_VOLUMETRIC_ILLUMINATION"           : 3,
     "BINDING_VOLUMETRIC_ILLUMINATION_SAMPLER"   : 4,
+    # Doom64-RT: the volumetric CLOUD MAP -- a lat-long image of world
+    # directions, marched by CmCloudMap.comp and sampled by the sky fragment
+    # shaders. Lives in the volumetric set so the sky pipelines, which already
+    # carry that set in their layout, need no new descriptor plumbing.
+    "BINDING_VOLUMETRIC_CLOUDMAP_STORAGE"       : 5,
+    "BINDING_VOLUMETRIC_CLOUDMAP_SAMPLER"       : 6,
+    "BINDING_VOLUMETRIC_CLOUDMAP_SAMPLER_PREV"  : 7,
     "BINDING_FLUID_PARTICLES_ARRAY"             : 0,
     "BINDING_FLUID_GENERATE_ID_TO_SOURCE"       : 1,
     "BINDING_FLUID_SOURCES"                     : 2,
@@ -347,7 +354,9 @@ CONST = {
     "GEOM_INST_FLAG_LIQUID_BIT1"            : BIT( 10 ),
     # Doom64-RT: lava surface. See RG_MESH_PRIMITIVE_LAVA.
     "GEOM_INST_FLAG_LAVA"                   : BIT( 11 ),
-    "GEOM_INST_FLAG_RESERVED_4"             : BIT( 12 ),
+    # Doom64-RT: scale on-screen emission by emissiveMult, as the indirect path
+    # already does. See RG_MESH_PRIMITIVE_EMISSIVE_SCREEN_SCALED.
+    "GEOM_INST_FLAG_EMIS_SCREEN_SCALED"     : BIT( 12 ),
     "GEOM_INST_FLAG_GLASS_IF_SMOOTH"        : BIT( 13 ),
     "GEOM_INST_FLAG_MIRROR_IF_SMOOTH"       : BIT( 14 ),
     "GEOM_INST_FLAG_EXISTS_LAYER1"          : BIT( 15 ),
@@ -475,6 +484,15 @@ CONST = {
     "COMPUTE_VOLUMETRIC_GROUP_SIZE_X"       : 16,
     "COMPUTE_VOLUMETRIC_GROUP_SIZE_Y"       : 16,
     "COMPUTE_SCATTER_ACCUM_GROUP_SIZE_X"    : 16,
+
+    # Doom64-RT: the cloud map. Lat-long, u = azimuth over 360 degrees, v =
+    # altitude over the UPPER hemisphere only (clouds are never below the
+    # horizon), so 1024x256 is 2.8 texels per degree of azimuth and the same
+    # of altitude. The march cost is this many texels, whatever the screen is.
+    "CLOUDMAP_WIDTH"                        : 1024,
+    "CLOUDMAP_HEIGHT"                       : 256,
+    "COMPUTE_CLOUDMAP_GROUP_SIZE_X"         : 16,
+    "COMPUTE_CLOUDMAP_GROUP_SIZE_Y"         : 16,
 
     # Doom64-RT: capacity of the localised-smoke puff list. The puffs ride in
     # the global uniform rather than a storage buffer, so this is a hard limit
@@ -611,7 +629,12 @@ GLOBAL_UNIFORM_STRUCT = [
     (TYPE_FLOAT32,      4,      "cameraPositionPrev",           1),
 
     (TYPE_UINT32,       1,      "debugShowFlags",               1),
-    (TYPE_UINT32,       1,      "indirSecondBounce",            1),
+    # Doom64-RT: GI path depth -- vertices after the primary hit, [1..4].
+    # Was indirSecondBounce, which nothing read: the shader gate meant to
+    # consume it sat commented out in RtRaygenIndirect.inl ("diffuse very
+    # red"), so the second bounce always ran. Same slot, same type, so std140
+    # is untouched. rt_gi_bounces.
+    (TYPE_UINT32,       1,      "indirectBounces",              1),
     (TYPE_UINT32,       1,      "lightCount",                   1),
     (TYPE_UINT32,       1,      "lightCountPrev",               1),
 
@@ -865,6 +888,55 @@ GLOBAL_UNIFORM_STRUCT = [
     (TYPE_FLOAT32,      4,      "stylizedLiquidTint",               4),
     (TYPE_FLOAT32,      4,      "stylizedLiquidCrest",              4),
 
+    # ONE vec4 each, holding a SCALAR per liquid -- not four vec4s like the two
+    # colours above. Indexed the same way: stylizedLiquidRelief[liquidId].
+    #
+    # relief: how much of the authored _n survives against the animated water
+    # wave. getNormal() overwrites the normal-mapped normal with the wave for
+    # any water surface, so without this a liquid can never show an _n at all.
+    # 0 keeps the old behaviour exactly, which is what water/nukage/sludge use.
+    #
+    # flow: depth of the detail-texture advection along the veins -- a flow
+    # map. The vein DIRECTION is baked into the height map's .g/.b as a vector
+    # (a raw angle would tear at a junction under bilinear filtering; a vector
+    # merely shrinks toward zero and fades). HitInfo.inl advects a detail
+    # texture along it with a two-phase ping-pong and hands the result across
+    # in framebufAlbedo.a.
+    (TYPE_FLOAT32,      4,      "stylizedLiquidRelief",             1),
+    (TYPE_FLOAT32,      4,      "stylizedLiquidFlow",               1),
+
+    # refl: scales the remapped-Schlick reflection F, per liquid. 1 is the
+    # stylizedWaterRefl{Min,Max} curve untouched, which is what water gets and
+    # what every liquid used to get. Mud is not a mirror: the same mirror
+    # reflection that sells water is the single loudest thing saying "this is
+    # water with brown paint on it".
+    #
+    # rough: surface roughness override. <= 0 means "use stylizedWaterRoughness"
+    # (0.1, a near-mirror), so a liquid that does not set it is unchanged.
+    # Note this is the roughness the DENOISER and the G-buffer see -- the
+    # reflection RAY is a pure mirror off shadeNormal either way, so what
+    # actually scatters a rough liquid's reflection is its authored relief
+    # normal. The two are meant to be used together.
+    (TYPE_FLOAT32,      4,      "stylizedLiquidRefl",               1),
+    (TYPE_FLOAT32,      4,      "stylizedLiquidRough",              1),
+    # Per-liquid scale on the caustics that liquid PROJECTS onto the geometry
+    # around it. A caustic is light refracted through a fluid and focused on
+    # what lies beyond it, so an opaque one makes none -- blood was throwing
+    # swimming-pool light on its own walls. The probe is receiver-side, so
+    # probeWaterBelow has to hand the liquid id back out for this.
+    (TYPE_FLOAT32,      4,      "stylizedLiquidCaustics",           1),
+    # The detail is sampled in a vein-aligned frame (u along the channel and
+    # scrolling, v across it): speed = detail tiles scrolled per second, scale =
+    # detail tiles per liquid tile, aspect = across-vein frequency multiplier
+    # that stretches the noise into lengthwise streaks.
+    (TYPE_FLOAT32,      1,      "liquidFlowSpeed",                  1),
+    (TYPE_FLOAT32,      1,      "liquidFlowScale",                  1),
+    (TYPE_FLOAT32,      1,      "liquidFlowAspect",                 1),
+    # 1 = paint the advected detail. Flat blue means it never crossed
+    # framebufAlbedo.a, which is indistinguishable from "too subtle" by eye and
+    # cost nothing to make separable.
+    (TYPE_FLOAT32,      1,      "liquidFlowDebug",                  1),
+
     # --- Lava (Doom64-RT) ----------------------------------------------------
     # The lava's emission cannot be baked bright enough to bloom: _e is 8-bit so
     # it caps at 1.0, screen emission is _e * emissionMaxScreenColor (3), and
@@ -896,7 +968,12 @@ GLOBAL_UNIFORM_STRUCT = [
     # it must be a multiple of FOUR floats or every field after it -- including
     # the mat4s at the end -- reads shifted, and the frame comes out black with
     # only the HUD on top. Eleven floats here did exactly that. Count them.
-    (TYPE_FLOAT32,      1,      "_padlava0",                        1),
+    # Taken from the _padlava0 slot so std140 is unchanged. > 0.5: NO stylized
+    # liquid splits, whatever its refl says -- every liquid shaded on every
+    # pixel at full resolution, no mirror ray, sheen from its roughness. The
+    # Options > Quality "Liquid surfaces" item; see d64_noSplit in
+    # RaygenPrimary.inl for why the split is unstable on an authored normal.
+    (TYPE_FLOAT32,      1,      "liquidNoSplit",                    1),
     (TYPE_FLOAT32,      1,      "_padlava1",                        1),
     (TYPE_FLOAT32,      1,      "_padlava",                         1),
     # Hue of the heat, multiplying the lava's emission on BOTH the screen and
@@ -992,7 +1069,12 @@ GLOBAL_UNIFORM_STRUCT = [
     # distance, not the camera's, so the beam further down the corridor -- the
     # look this is all for -- survives. 0 = physical behaviour.
     (TYPE_FLOAT32,      1,      "volumeLightNearFade",              1),
-    (TYPE_FLOAT32,      1,      "_padf2",                           1),
+    # Doom64-RT: 1 = reproduce the stock bounce>=2 weighting, which multiplied
+    # by 1/pdf (= pi/cos) and nothing else -- pi/cos too much for a cosine-
+    # sampled Lambertian, mean ~2pi. 0 = the correct throughput of exactly 1.
+    # Taken from the _padf2 slot: a uint is the same 4 bytes, so std140 is
+    # unchanged and check_uniform_layout.py stays silent. rt_gi_bounce_legacy.
+    (TYPE_UINT32,       1,      "indirectLegacyWeight",             1),
 
     # --- Localised smoke (Doom64-RT) -----------------------------------------
     # A separate group, appended AFTER the whole volume block rather than
@@ -1430,6 +1512,63 @@ GLOBAL_UNIFORM_STRUCT = [
     # Took the two nrdReserved spares.
     (TYPE_UINT32,       1,      "rrDemod",                          1),
     (TYPE_UINT32,       1,      "rrDemodFilter",                    1),
+    # Doom64-RT: the first-person weapon must not damage the SURFACE
+    # denoiser's history either (docs/rt-volumetric-weapon-trails.md, the
+    # same class one buffer over). svgfFp: 0 = stock, 1 = a pixel whose
+    # history was fully rejected borrows validated neighbour history instead
+    # of restarting from one sample, 2 = debug (tint borrowed pixels).
+    # svgfFpGrad: 0 = stock, 1 = the A-SVGF gradient never samples the
+    # weapon and treats a vanished light as a change, not as "no change".
+    (TYPE_UINT32,       1,      "svgfFp",                           1),
+    (TYPE_UINT32,       1,      "svgfFpGrad",                       1),
+    # Doom64-RT: the indirect (bounce) ghost. A-SVGF accumulated indirect over
+    # up to 256 frames, so a rocket flash's bounce lingered for seconds after
+    # the light died -- read in play as "the light lingers". svgfIndirMaxHist
+    # caps the indirect history length in frames (0 = stock 256).
+    # svgfIndirAntilag 1 drops the "if it's bright enough, don't drop history"
+    # suppression on the indirect antilag, which protected the brightest ghosts.
+    (TYPE_FLOAT32,      1,      "svgfIndirMaxHist",                 1),
+    (TYPE_UINT32,       1,      "svgfIndirAntilag",                 1),
+
+    # Doom64-RT: VOLUMETRIC CLOUDS (RgDrawFrameVolumetricCloudParams). All
+    # vec4s, so they sit after the scalar run and cannot disturb it.
+    #   cloudParams0: x enabled, y altitude (m), z thickness (m), w coverage
+    #   cloudParams1: x density /m, y 1/featureSize, z detail, w time (s)
+    #   cloudParams2: x steps, y lightSteps, z horizonFade (deg), w historyBlend
+    #   cloudParams3: x transmitFloor, y asymmetry, z debugMode, w wind.x (m/s)
+    #   cloudTint:    rgb albedo, w wind.y (m/s)
+    #   cloudLightDir: xyz toward the light, w underStrength
+    #   cloudLightColor / cloudUnderColor / cloudAmbient: rgb, w spare
+    (TYPE_FLOAT32,      4,      "cloudParams0",                     1),
+    (TYPE_FLOAT32,      4,      "cloudParams1",                     1),
+    (TYPE_FLOAT32,      4,      "cloudParams2",                     1),
+    (TYPE_FLOAT32,      4,      "cloudParams3",                     1),
+    (TYPE_FLOAT32,      4,      "cloudTint",                        1),
+    (TYPE_FLOAT32,      4,      "cloudLightDir",                    1),
+    (TYPE_FLOAT32,      4,      "cloudLightColor",                  1),
+    (TYPE_FLOAT32,      4,      "cloudUnderColor",                  1),
+    (TYPE_FLOAT32,      4,      "cloudAmbient",                     1),
+    # THE FIRE SKY. cloudBackColor: rgb = fire colour, w = strength of the
+    # glow BEHIND the slab (added as glow * T in the composite: thin cloud
+    # burns, dense cloud is a silhouette, clear sky is the glow).
+    # cloudFireParams: x = emission strength of FIRE POCKETS -- a second,
+    # sparse noise field inside the slab that glows along the ray and lights
+    # the cloud around it (the "fire between the clouds"); y = 1/pocket
+    # feature size; z = pocket threshold (1 - cover); w = how strongly a
+    # pocket lights the cloud near it.
+    (TYPE_FLOAT32,      4,      "cloudBackColor",                   1),
+    (TYPE_FLOAT32,      4,      "cloudFireParams",                  1),
+    # cloudLayerParams: x = layers (1 or 2), y = gap fraction of the slab
+    # between the two decks (the fire sheet lives in it), z = sheet
+    # extinction relative to the cloud's, w spare.
+    (TYPE_FLOAT32,      4,      "cloudLayerParams",                 1),
+    # cloudFireAnim: x = slow pulse amplitude (0..1), y = pulse speed, z =
+    # fast flicker amplitude, w = 1/streak width of the cascades (m).
+    # cloudCascade: FLAME CASCADES -- fire raining from the cloud base as
+    # vertical streaks. x = emission, y = 1/length below the base (m), z =
+    # streak threshold (1 - cover), w = fall speed (m/s). Time is cloudParams1.w.
+    (TYPE_FLOAT32,      4,      "cloudFireAnim",                    1),
+    (TYPE_FLOAT32,      4,      "cloudCascade",                     1),
 
     # xyz = centre in world space (metres, the same space as a light's position
     # and as volume_getCenter's output), w = radius in metres.
@@ -1491,6 +1630,14 @@ GEOM_INSTANCE_STRUCT = [
     (TYPE_UINT32,       1,      "firstVertex_Layer1",   1),
     (TYPE_UINT32,       1,      "firstVertex_Layer2",   1),
     (TYPE_UINT32,       1,      "firstVertex_Layer3",   1),
+
+    # Doom64-RT: GI emission for EMIS_SCREEN_SCALED instances, in the material's
+    # units, animated separately from emissiveMult (which is then screen-only).
+    # See RgMeshPrimitiveInfo::emissiveGi. Padded to a whole 16-byte row.
+    (TYPE_FLOAT32,      1,      "emissiveMultGi",       1),
+    (TYPE_UINT32,       1,      "_padGi0",              1),
+    (TYPE_UINT32,       1,      "_padGi1",              1),
+    (TYPE_UINT32,       1,      "_padGi2",              1),
 ]
 
 # TODO: make more compact

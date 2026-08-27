@@ -205,6 +205,7 @@ typedef enum RgStructureType
     RG_STRUCTURE_TYPE_START_FRAME_FLUID_PARAMS              = 35,
     RG_STRUCTURE_TYPE_DRAW_FRAME_SMOKE_PARAMS               = 36,
     RG_STRUCTURE_TYPE_DRAW_FRAME_LIGHT_SHAFT_PARAMS         = 37,
+    RG_STRUCTURE_TYPE_DRAW_FRAME_VOLUMETRIC_CLOUD_PARAMS    = 38,
 } RgStructureType;
 
 typedef enum RgTextureSwizzling
@@ -450,6 +451,42 @@ typedef enum RgMeshPrimitiveFlagBits
     // Doom64-RT: this primitive is a camera-facing BILLBOARD. Set it and the
     // sprite material dials below apply instead of the world ones.
     RG_MESH_PRIMITIVE_SPRITE                = 1 << 23,
+    // Doom64-RT: VOLUMETRIC CLOUDS, for RG_MESH_PRIMITIVE_SKY geometry only.
+    // The clouds are marched once per frame into a world-direction map
+    // (RgDrawFrameVolumetricCloudParams); these say what each sky draw does
+    // with it. Neither flag does anything unless the clouds are enabled.
+    //
+    // SKY_CLOUDS: this is the BACKDROP (the dome). The fragment becomes
+    // backdrop * transmittance + cloud radiance -- the clouds are composited
+    // over it.
+    RG_MESH_PRIMITIVE_SKY_CLOUDS            = 1 << 24,
+    // SKY_BEHIND_CLOUDS: this sits behind the clouds but is drawn AFTER the
+    // backdrop (a moon disc). Multiplied by transmittance only, so it is
+    // occluded by cloud without adding the cloud a second time.
+    //
+    // A sky draw with neither flag (a lightning bolt) is in front of the
+    // clouds and is left untouched.
+    RG_MESH_PRIMITIVE_SKY_BEHIND_CLOUDS     = 1 << 25,
+    // Doom64-RT: scale this primitive's ON-SCREEN emission by `emissive`, the way
+    // the indirect path already does.
+    //
+    // The asymmetry this exists for is deliberate and documented in HitInfo.inl:
+    // with an _e map, PRIMARY and REFLECTION emission is the RAW _e sample, and
+    // emissiveMult is applied on the INDIRECT path only. So a caller can change how
+    // much a painted fixture contributes to bounce light, and cannot change how
+    // bright it LOOKS, at all.
+    //
+    // That is correct for nearly everything -- a painted lamp should look the same
+    // brightness whatever the renderer is doing with its GI. It is wrong for a
+    // fixture that is supposed to switch: MAP01's pre-exit pillar sweeps a light
+    // around four bulb panels, and with the raw-_e rule the painted bulbs stay lit
+    // at full strength through the whole cycle no matter what `emissive` says --
+    // four permanently-on lamps with a light moving behind them.
+    //
+    // OPT-IN, one bit per primitive, so the rest of the game keeps the balance it
+    // was tuned with. Combine with RG_MESH_PRIMITIVE_EMISSIVE_OVERRIDE, or
+    // TextureMeta will replace `emissive` with the material's constant first.
+    RG_MESH_PRIMITIVE_EMISSIVE_SCREEN_SCALED = 1 << 26,
 } RgMeshPrimitiveFlagBits;
 typedef uint32_t RgMeshPrimitiveFlags;
 
@@ -578,6 +615,14 @@ typedef struct RgMeshPrimitiveInfo
     float                       emissive;
     // Default: 1.0
     float                       classicLight;
+    // Doom64-RT: read ONLY when RG_MESH_PRIMITIVE_EMISSIVE_SCREEN_SCALED is set.
+    // What this primitive feeds the GI (indirect path), in the material's units,
+    // while `emissive` is then what it LOOKS like on the primary ray. Two values
+    // because they are animated on different clocks: a fixture's painted bulbs
+    // are delayed to meet the light they cast, which arrives late through the
+    // denoiser history -- and the light itself must not be delayed with them, or
+    // the two chase each other forever. Ignored otherwise; leave 0.
+    float                       emissiveGi;
 } RgMeshPrimitiveInfo;
 
 // Mesh is a set of primitives.
@@ -1106,12 +1151,21 @@ typedef struct RgDrawFrameIlluminationParams
     void*           pNext;
     // Shadow rays are cast, if illumination bounce index is in [0, maxBounceShadows).
     uint32_t        maxBounceShadows;
-    // If false, only one bounce will be cast from a primary surface.
-    // If true, a bounce of that bounce will be also cast.
-    // If false, reflections and indirect diffuse might appear darker,
-    // since inside of them, shadowed areas are just pitch black.
-    // Default: true
-    RgBool32        enableSecondBounceForIndirect;
+    // Doom64-RT: number of path vertices after the primary hit for indirect
+    // diffuse, clamped to [1..4] inside. 1 = a single bounce, 2 = the stock
+    // two. A vertex at index >= maxBounceShadows samples NO analytic lights
+    // (RaygenCommon.h isDirectIlluminationValid), so to light depth N pass
+    // maxBounceShadows >= N + 1 -- the caller owns that coupling.
+    // Replaces enableSecondBounceForIndirect, which nothing ever read.
+    // Default: 2
+    uint32_t        indirectBounces;
+    // Doom64-RT: if true, bounces >= 2 keep the stock weighting -- radiance
+    // multiplied by 1/pdf alone, which for a cosine-sampled Lambertian is
+    // pi/cos too much (mean ~2pi): the second bounce came out bright,
+    // saturated and firefly-prone. False applies the correct throughput of
+    // exactly 1. Default: true, so the shipped image does not move until the
+    // fix has been judged on its own.
+    RgBool32        indirectLegacyBounceWeight;
     // Size of the side of a cell for the light grid. Use RG_DEBUG_DRAW_LIGHT_GRID_BIT for the debug view.
     // Each cell is used to store a fixed amount of light samples that are important for the cell's center and radius.
     // Default: 1.0
@@ -1188,8 +1242,11 @@ typedef struct RgDrawFrameIlluminationParams
     // unfiltered-direct buffer instead of radiance (green ramp, M/32). ReSTIR
     // at 1 spp only converges because temporal reuse grows M; if M collapses
     // under camera motion the raw signal is genuinely noisier while moving,
-    // upstream of any denoiser. Default: false
-    RgBool32        debugRestirM;
+    // upstream of any denoiser. 1 = the DIRECT reservoir (RtRaygenDirect.rgen),
+    // 2 = the INDIRECT reservoir, painted into the unfiltered-indirect buffer
+    // (RtRaygenIndirect.inl) -- view it with the unfiltered-indirect debug
+    // layer. Default: 0
+    uint32_t        debugRestirM;
     // Debug: write the shadow-ray visibility term into the unfiltered-direct
     // buffer. The final image cannot separate "the occluder never blocked the
     // ray" from "the shadow is cast but drowned in fill light or smeared by the
@@ -1198,6 +1255,12 @@ typedef struct RgDrawFrameIlluminationParams
     // 0 = off, 1 = greyscale (black where shadowed), 2 = normal shading with
     // shadowed pixels tinted red. Default: 0
     uint32_t        debugVisibility;
+    // Doom64-RT: raw DEBUG_SHOW_FLAG_* bits OR'd into the debug view, so a
+    // layer can be isolated from a cvar instead of the dev window. 1 motion,
+    // 2 gradients, 4 unfiltered direct, 8 unfiltered spec, 16 unfiltered
+    // indirect, 32 only direct diffuse, 64 only specular, 128 only indirect,
+    // 1024 normals. Default 0.
+    uint32_t        debugShowFlags;
     // ReSTIR temporal reuse tap jitter radius in pixels. Stock 2.0. The jitter
     // decorrelates the temporal tap, but on grazing surfaces a 2px offset moves
     // depth far past the flat 10% reuse threshold, so the tap is rejected and M
@@ -1329,6 +1392,19 @@ typedef struct RgDrawFrameIlluminationParams
     float           nrdPhiLuminance;        // diffuse a-trous luminance sensitivity, default 2
     float           nrdMinHitDistWeight;    // (0;0.2], default 0.1; smaller for ReSTIR
     RgBool32        nrdAntiFirefly;         // default true
+    // Doom64-RT: the first-person weapon vs the SURFACE denoiser's history.
+    // svgfFp: 0 = stock A-SVGF (a pixel the gun just uncovered restarts from
+    // one sample and reads as a dark silhouette beside lagging neighbours
+    // under a decaying light), 1 = fully rejected pixels borrow validated
+    // neighbour history, 2 = debug tint. svgfFpGrad: the gradient never
+    // samples the weapon and a vanished light counts as a change. Default 0.
+    uint32_t        svgfFp;
+    RgBool32        svgfFpGrad;
+    // Doom64-RT: indirect history cap in frames (0 = stock 256) and the
+    // indirect antilag without its brightness suppression. The bounce of a
+    // transient light otherwise ghosts for seconds after the light is gone.
+    float           svgfIndirMaxHist;
+    RgBool32        svgfIndirAntilag;
 } RgDrawFrameIlluminationParams;
 
 // Can be linked after RgDrawFrameInfo.
@@ -1717,6 +1793,141 @@ typedef struct RgDrawFrameLightShaftParams
     float           relativeCull;
 } RgDrawFrameLightShaftParams;
 
+// Doom64-RT: VOLUMETRIC CLOUDS. Can be linked after RgDrawFrameInfo.
+//
+// A cloud slab between `altitude` and `altitude + thickness` metres above the
+// sky viewer, ray-marched ONCE per frame into a lat-long map of world
+// directions (not per screen pixel -- the sky is rasterised twice, once at
+// render resolution into the albedo and once into the 256^2 GI cubemap, and
+// the same map feeds both). RsSky.frag composites the map over sky draws
+// flagged RG_MESH_PRIMITIVE_SKY_CLOUDS and occludes draws flagged
+// RG_MESH_PRIMITIVE_SKY_BEHIND_CLOUDS.
+//
+// The map is a WORLD-DIRECTION image, so its temporal history (historyBlend)
+// is keyed by direction alone: no motion vectors, no depth, no reprojection,
+// and therefore nothing a sprite in front of the sky can invalidate. That is
+// deliberate -- the froxel volume's screen-space history was what sprites
+// smeared (see the caller's rt-volumetric-weapon-trails.md).
+//
+// Output radiance is in the same units as the sky texture (0..1, scaled by
+// RgDrawFrameSkyParams::skyColorMultiplier downstream), so a tint of 1,1,1 on
+// a white-lit cloud lands at the brightness the sky art would.
+typedef struct RgDrawFrameVolumetricCloudParams
+{
+    RgStructureType sType;
+    void*           pNext;
+    // 0 = off: the map is not marched and the sky draws are untouched.
+    RgBool32        enabled;
+    // Bottom of the slab above the sky viewer, metres. Default 600.
+    float           altitude;
+    // Slab thickness, metres. Default 500.
+    float           thickness;
+    // 0..1, fraction of the sky covered. Default 0.55.
+    float           coverage;
+    // Extinction per metre inside a fully dense cell. Default 0.01.
+    float           density;
+    // Size of the largest noise feature, metres. Default 1500.
+    float           featureSize;
+    // How much the high-frequency erosion eats into the shapes, 0..1. Default 0.5.
+    float           detail;
+    // Wind vector, metres per second, in the sky viewer's horizontal plane.
+    RgFloat2D       wind;
+    // Seconds, for the wind. Pass the caller's playsim time so weather stops
+    // when the level does.
+    float           time;
+    // View-ray steps through the slab and light steps toward the light.
+    // Default 32 and 6.
+    uint32_t        steps;
+    uint32_t        lightSteps;
+    // The cloud's own colour (scattering albedo). Default 1,1,1.
+    RgFloat3D       tint;
+    // Direction TOWARD the light (the moon) and its colour at the cloud,
+    // in sky-texture units. A light below the horizon is ignored.
+    RgFloat3D       lightDir;
+    RgFloat3D       lightColor;
+    // A second light from BELOW -- a burning ground. Colour in sky-texture
+    // units, strength 0 = off. Default 0.
+    RgFloat3D       underColor;
+    float           underStrength;
+    // Ambient added to every cloud sample, sky-texture units. Default 0.
+    RgFloat3D       ambient;
+    // Henyey-Greenstein asymmetry for the light. Default 0.3.
+    float           asymmetry;
+    // What a FULLY opaque column still transmits, 0..1 (the same meaning as
+    // the shell deck's transmit). Default 0.
+    float           transmitFloor;
+    // Altitude (degrees) below which the clouds fade to nothing, so the slab's
+    // far edge does not end as a hard line. Default 4.
+    float           horizonFade;
+    // Temporal blend of the previous map, 0..0.95. Default 0.8.
+    float           historyBlend;
+    // 0 normal; 1 paint transmittance; 2 paint density only; 3 bypass the
+    // composite (map still marched).
+    uint32_t        debugMode;
+    // PER-RAY OCCLUSION OF THE DIRECTIONAL LIGHT. Every shadow ray toward the
+    // directional light samples the cloud map where it would cross the slab
+    // (parallax-corrected at the slab's middle) and attenuates the light by
+    // T + (1 - T) * lightTransmit * tint, blended toward 1 by (1 -
+    // lightOcclude). Surfaces, indirect bounces and the froxel volume all go
+    // through the same sample, so shafts get real gaps between clouds and
+    // the ground gets cloud shadows that drift with the wind.
+    // While this is on the caller should NOT also dim the light globally.
+    RgBool32        sunOcclusion;
+    // What a fully opaque column still passes of the light, 0..1.
+    float           lightTransmit;
+    // 0..1, how much of the occlusion to apply. Default 1.
+    float           lightOcclude;
+    // A glow BEHIND the slab, sky-texture units. Composited as glow *
+    // transmittance over backdrop draws: thin cloud burns with it, dense
+    // cloud is a silhouette against it, clear sky IS it. This is what a
+    // burning sky looks like (dark cloud against fire), and it is not the
+    // same thing as underColor, which lights the underside evenly.
+    // Default 0,0,0.
+    RgFloat3D       backColor;
+    // Strength of the backColor glow behind the slab. Default 0.
+    float           backStrength;
+    // FIRE POCKETS: a second, sparse noise field inside the slab. Where it
+    // is above its threshold the cloud gas itself GLOWS in backColor along
+    // the ray (fire in the gaps and thin edges) and lights the cloud around
+    // it -- the "fire between the clouds". fireStrength is the emission
+    // (sky units, 0 = off), fireScale the pocket feature size in metres,
+    // fireCover the fraction of the slab that burns (0..1), fireLit how
+    // strongly a pocket lights the cloud near it.
+    float           fireStrength;
+    float           fireScale;
+    float           fireCover;
+    float           fireLit;
+    // TWO DECKS. layers = 2 splits the slab into a lower deck, a gap of
+    // gapFraction of the thickness, and an upper deck; the fire field
+    // becomes a SHEET in the gap -- an emissive burning layer between the
+    // clouds that lights the upper deck's underside and the lower deck's
+    // tops, each through its own optical depth toward it. layers = 1 is the
+    // single slab with fire pockets. Default 1, 0.2.
+    uint32_t        layers;
+    float           gapFraction;
+    // Extinction of the sheet itself relative to the cloud's density, so
+    // looking through fire is a haze rather than glass. Default 0.3.
+    float           sheetExtinction;
+    // The fire PULSES: each burning patch breathes slowly (firePulse, 0..1
+    // amplitude, at firePulseSpeed) and flickers fast on top (fireFlicker).
+    // Applied to the emission and to the light the fire casts on the decks.
+    // Default 0, 1, 0.
+    float           firePulse;
+    float           firePulseSpeed;
+    float           fireFlicker;
+    // FLAME CASCADES: the fire raining DOWN from the cloud base as thin
+    // vertical streaks, seeded under the burning parts of the sheet and
+    // falling at cascadeSpeed m/s through a band cascadeLength metres below
+    // the base. cascadeStrength is the emission (0 = off), cascadeCover the
+    // fraction of the base that rains (0..1), cascadeWidth the streak width
+    // in metres. Default 0, 400, 0.3, 80, 40.
+    float           cascadeStrength;
+    float           cascadeLength;
+    float           cascadeCover;
+    float           cascadeSpeed;
+    float           cascadeWidth;
+} RgDrawFrameVolumetricCloudParams;
+
 // Can be linked after RgDrawFrameInfo.
 typedef struct RgDrawFrameBloomParams
 {
@@ -1910,6 +2121,45 @@ typedef struct RgDrawFrameReflectRefractParams
     //            NOT white: white crests read as foam/plastic)
     RgFloat3D       stylizedLiquidTint[ 4 ];
     RgFloat3D       stylizedLiquidCrest[ 4 ];
+    // Doom64-RT: how much of the MATERIAL normal survives on a liquid surface,
+    // per liquid id. 0 = the animated water wave, exactly as before. 1 = the
+    // authored _n only, i.e. a still surface with real relief -- which is what
+    // a coagulated blood pool is, and what the ripple cannot be.
+    //
+    // The wave is not merely cosmetic here: getNormal() OVERWRITES the
+    // normal-mapped normal with it for any water surface, so without this a
+    // liquid can never show an _n map at all.
+    float           stylizedLiquidRelief[ 4 ];
+    // Doom64-RT: depth of the FLOW MAP on each liquid -- a detail texture
+    // advected along the vein direction baked into the height map's .g/.b, so
+    // texture visibly travels down each channel. 0 = still.
+    float           stylizedLiquidFlow[ 4 ];
+    // Doom64-RT: per-liquid scale on the stylized reflection F. 1 = the
+    // stylizedWaterRefl{Min,Max} curve untouched. Below 1 for an opaque bed
+    // like mud, where a mirror reflection is what makes it read as water.
+    // EXACTLY 0 = no mirror ray and no checkerboard split at all: the surface
+    // is shaded on every pixel and its sheen is the standard glossy specular.
+    float           stylizedLiquidRefl[ 4 ];
+    // Doom64-RT: per-liquid surface roughness. <= 0 = use
+    // stylizedWaterRoughness, so a liquid that does not set it is unchanged.
+    float           stylizedLiquidRough[ 4 ];
+    // Doom64-RT: != 0 forces the no-split path for EVERY stylized liquid,
+    // regardless of stylizedLiquidRefl. Full-res surface, no mirror ray.
+    float           liquidNoSplit;
+    // Doom64-RT: per-liquid scale on the caustics this liquid PROJECTS onto the
+    // geometry around it. A caustic is light refracted through a fluid and
+    // focused beyond it, so an opaque liquid casts none. 1 = as before.
+    float           stylizedLiquidCaustics[ 4 ];
+    // The detail is sampled in a vein-aligned frame (u along the channel and
+    // scrolling, v across it): speed = detail tiles scrolled per second,
+    // scale = detail tiles per liquid tile, aspect = across-vein frequency
+    // multiplier that stretches the noise into lengthwise streaks.
+    float           liquidFlowSpeed;
+    float           liquidFlowScale;
+    float           liquidFlowAspect;
+    // 1 = paint the advected detail on liquid surfaces. Flat blue = it never
+    // arrived, which by eye is identical to "too subtle".
+    float           liquidFlowDebug;
     // Doom64-RT lava. Screen-emission multiplier for lava surfaces, on top of
     // emissionMaxScreenColor -- this is what lets the cracks reach the bloom
     // threshold. The rest animate the heat: a slowly drifting field that is
@@ -1927,6 +2177,7 @@ typedef struct RgDrawFrameReflectRefractParams
     float           lavaGiBoost;
     // 1 = paint lava surfaces magenta.
     float           lavaDebug;
+
     // Hue of the heat, applied to both the screen emission and the GI.
     RgFloat3D       lavaTint;
     // Diagnostic: paint water surfaces magenta (stylized branch running) or

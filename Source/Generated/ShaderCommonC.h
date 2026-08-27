@@ -48,6 +48,9 @@ namespace RTGL1
 #define BINDING_VOLUMETRIC_SAMPLER_PREV (2)
 #define BINDING_VOLUMETRIC_ILLUMINATION (3)
 #define BINDING_VOLUMETRIC_ILLUMINATION_SAMPLER (4)
+#define BINDING_VOLUMETRIC_CLOUDMAP_STORAGE (5)
+#define BINDING_VOLUMETRIC_CLOUDMAP_SAMPLER (6)
+#define BINDING_VOLUMETRIC_CLOUDMAP_SAMPLER_PREV (7)
 #define BINDING_FLUID_PARTICLES_ARRAY (0)
 #define BINDING_FLUID_GENERATE_ID_TO_SOURCE (1)
 #define BINDING_FLUID_SOURCES (2)
@@ -91,7 +94,7 @@ namespace RTGL1
 #define GEOM_INST_FLAG_LIQUID_BIT0 (1 << 9)
 #define GEOM_INST_FLAG_LIQUID_BIT1 (1 << 10)
 #define GEOM_INST_FLAG_LAVA (1 << 11)
-#define GEOM_INST_FLAG_RESERVED_4 (1 << 12)
+#define GEOM_INST_FLAG_EMIS_SCREEN_SCALED (1 << 12)
 #define GEOM_INST_FLAG_GLASS_IF_SMOOTH (1 << 13)
 #define GEOM_INST_FLAG_MIRROR_IF_SMOOTH (1 << 14)
 #define GEOM_INST_FLAG_EXISTS_LAYER1 (1 << 15)
@@ -188,6 +191,10 @@ namespace RTGL1
 #define COMPUTE_VOLUMETRIC_GROUP_SIZE_X (16)
 #define COMPUTE_VOLUMETRIC_GROUP_SIZE_Y (16)
 #define COMPUTE_SCATTER_ACCUM_GROUP_SIZE_X (16)
+#define CLOUDMAP_WIDTH (1024)
+#define CLOUDMAP_HEIGHT (256)
+#define COMPUTE_CLOUDMAP_GROUP_SIZE_X (16)
+#define COMPUTE_CLOUDMAP_GROUP_SIZE_Y (16)
 #define SMOKE_PUFF_MAX (128)
 #define VOLUME_SHAFT_LIGHT_MAX (64)
 #define VOLUME_ENABLE_NONE (0)
@@ -247,7 +254,7 @@ struct ShGlobalUniform
     float cameraPosition[4];
     float cameraPositionPrev[4];
     uint32_t debugShowFlags;
-    uint32_t indirSecondBounce;
+    uint32_t indirectBounces;
     uint32_t lightCount;
     uint32_t lightCountPrev;
     float emissionMapBoost;
@@ -356,6 +363,15 @@ struct ShGlobalUniform
     float stylizedWaterReflMin;
     float stylizedLiquidTint[16];
     float stylizedLiquidCrest[16];
+    float stylizedLiquidRelief[4];
+    float stylizedLiquidFlow[4];
+    float stylizedLiquidRefl[4];
+    float stylizedLiquidRough[4];
+    float stylizedLiquidCaustics[4];
+    float liquidFlowSpeed;
+    float liquidFlowScale;
+    float liquidFlowAspect;
+    float liquidFlowDebug;
     float lavaEmisBoost;
     float lavaFlowStrength;
     float lavaFlowSpeed;
@@ -365,7 +381,7 @@ struct ShGlobalUniform
     float lavaPulseSpeed;
     float lavaGiBoost;
     float lavaDebug;
-    float _padlava0;
+    float liquidNoSplit;
     float _padlava1;
     float _padlava;
     float lavaTint[4];
@@ -386,7 +402,7 @@ struct ShGlobalUniform
     float volumeScatteringFar;
     float volumeDensityCurve;
     float volumeLightNearFade;
-    float _padf2;
+    uint32_t indirectLegacyWeight;
     uint32_t smokeCount;
     float smokeLightNearFade;
     float smokeIllumBlend;
@@ -435,6 +451,24 @@ struct ShGlobalUniform
     float rrGlowScale;
     uint32_t rrDemod;
     uint32_t rrDemodFilter;
+    uint32_t svgfFp;
+    uint32_t svgfFpGrad;
+    float svgfIndirMaxHist;
+    uint32_t svgfIndirAntilag;
+    float cloudParams0[4];
+    float cloudParams1[4];
+    float cloudParams2[4];
+    float cloudParams3[4];
+    float cloudTint[4];
+    float cloudLightDir[4];
+    float cloudLightColor[4];
+    float cloudUnderColor[4];
+    float cloudAmbient[4];
+    float cloudBackColor[4];
+    float cloudFireParams[4];
+    float cloudLayerParams[4];
+    float cloudFireAnim[4];
+    float cloudCascade[4];
     float smokePuffs[512];
     float smokeAlbedoDensity[512];
     float smokeShape[512];
@@ -475,6 +509,10 @@ struct ShGeometryInstance
     uint32_t firstVertex_Layer1;
     uint32_t firstVertex_Layer2;
     uint32_t firstVertex_Layer3;
+    float emissiveMultGi;
+    uint32_t _padGi0;
+    uint32_t _padGi1;
+    uint32_t _padGi2;
 };
 
 struct ShTonemapping

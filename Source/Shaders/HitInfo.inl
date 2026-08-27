@@ -174,6 +174,35 @@ float sampleHeightMap( const uint textureIndex, const vec2 texCoords )
     return getTextureSampleLod( textureIndex, texCoords, 0 ).r;
 }
 
+// Doom64-RT: noise for the liquid flow. PROCEDURAL, and that is the fix, not a
+// style choice: the first advection sampled the water normal map's X channel,
+// and a normal map's X hugs 0.5 by construction -- the pattern moved and the
+// modulation it carried was a few percent, which is invisible at any speed.
+// (getLavaHeat samples the same channels; "the lava flow does not do much" is
+// almost certainly the same disease.) Value noise on a 256-periodic lattice:
+// periodic so the scrolled coordinate can wrap with NO seam, which also keeps
+// the hash's fract() inputs small enough for float32 over a long session.
+float d64_flowHash( vec2 cell )
+{
+    cell = fract( cell * vec2( 0.1031, 0.1972 ) );
+    cell += dot( cell, cell.yx + 33.33 );
+    return fract( ( cell.x + cell.y ) * cell.x );
+}
+
+float d64_flowNoise( vec2 p )
+{
+    vec2 i = mod( floor( p ), 256.0 );
+    vec2 f = fract( p );
+    vec2 s = f * f * ( 3.0 - 2.0 * f );
+
+    float a = d64_flowHash( i );
+    float b = d64_flowHash( mod( i + vec2( 1, 0 ), 256.0 ) );
+    float c = d64_flowHash( mod( i + vec2( 0, 1 ), 256.0 ) );
+    float d = d64_flowHash( mod( i + vec2( 1, 1 ), 256.0 ) );
+
+    return mix( mix( a, b, s.x ), mix( c, d, s.x ), s.y );
+}
+
 const int ParallaxLinearSteps       = 10;
 const int ParallaxBinarySearchSteps = 4;
 
@@ -257,11 +286,19 @@ vec3 sanitizeNormal( const vec3 triangleNormal, //
 #if defined(HITINFO_INL_PRIM)
 
 ShHitInfo getHitInfoPrimaryRay(
-    const ShPayload pl, 
-    const vec3 rayOrigin, const vec3 viewDir, const vec3 rayDirAX, const vec3 rayDirAY, 
-    out vec2 motion, out float motionDepthLinear, 
+    const ShPayload pl,
+    const vec3 rayOrigin, const vec3 viewDir, const vec3 rayDirAX, const vec3 rayDirAY,
+    out vec2 motion, out float motionDepthLinear,
     out vec2 gradDepth, out float depthNDC, out float depthLinear,
-    out vec3 emission)
+    out vec3 emission,
+    // Doom64-RT: the liquid FLOW DETAIL, 0..1 -- a noise texture advected along
+    // the vein direction baked into the height map's .g/.b. It has to be built
+    // HERE and handed onward: the stylized liquid surface is shaded in the
+    // refl/refr pass, which restores its hit from the G-buffer and has no
+    // ShTriangle, so it can never sample a material texture of its own.
+    // Exactly 0 means "no flow here" (not a liquid, no height map, or a texel
+    // the bake left still).
+    out float liquidFlow)
 
 #elif defined(HITINFO_INL_RFL)
 
@@ -283,6 +320,10 @@ ShHitInfo getHitInfoBounce(
 #endif
 {
     ShHitInfo h;
+
+#if defined( HITINFO_INL_PRIM )
+    liquidFlow = 0.0;
+#endif
 
     int instanceId, instCustomIndex;
     int geomIndex, primIndex;
@@ -489,6 +530,67 @@ ShHitInfo getHitInfoBounce(
                                             globalUniform.parallaxMaxDepth );
     }
 
+#if defined( HITINFO_INL_PRIM )
+    // Doom64-RT: the flow map. The height map's .g/.b carry the vein's tangent
+    // DIRECTION in texture space (sampleHeightMap() reads .r and nothing else,
+    // so they are free on a map we already author, and they are registered
+    // with the albedo, parallax shift included -- this runs AFTER the block
+    // above, so the flow follows the same displaced texel the colour does).
+    //
+    // The detail is sampled in a VEIN-ALIGNED frame: u runs along the channel
+    // and SCROLLS, v runs across it at liquidFlowAspect times the frequency.
+    // That turns the noise into elongated streaks sliding lengthwise down the
+    // vein, which is the strongest "liquid running" cue there is. Two earlier
+    // versions failed short of it and are worth remembering:
+    //   1. a brightness band on a baked phase -- nothing in the picture is
+    //      displaced, the eye reads flicker;
+    //   2. round blobs advected from base UV with a ping-pong cross-fade --
+    //      isotropic blobs at vein scale read as shimmer, and the two blended
+    //      copies soften what little motion there was.
+    // No ping-pong here, and none needed: it existed to bound the distortion
+    // of an offset-from-base advection, but scrolling the wrapping noise's OWN
+    // coordinate is well-defined forever and never resets. Where the direction
+    // varies along a run the frame shears the noise slightly -- fine, liquid
+    // shears.
+    //
+    // The direction is a VECTOR, not an angle: bilinear filtering between two
+    // disagreeing texels shrinks it toward zero, so the flow FADES at a
+    // junction or a sign flip instead of tearing. Length gates it.
+    if( ( tr.geometryInstanceFlags & GEOM_INST_FLAG_MEDIA_TYPE_WATER ) != 0 &&
+        tr.heightTexture != MATERIAL_NO_TEXTURE )
+    {
+        vec2 dir =
+            getTextureSampleLod( tr.heightTexture, texCoords[ 0 ], 0 ).gb * 2.0 - vec2( 1.0 );
+        const float len = length( dir );
+        // 0.15: above the noise of two blended texels. Cells bake to (0,0).
+        if( len > 0.15 )
+        {
+            dir /= len;
+            const vec2 perp = vec2( -dir.y, dir.x );
+
+            // liquidFlowScale: detail tiles per liquid tile along the vein.
+            // liquidFlowSpeed: detail tiles scrolled per second.
+            const float u = dot( texCoords[ 0 ], dir ) * globalUniform.liquidFlowScale -
+                            globalUniform.time * globalUniform.liquidFlowSpeed;
+            const float v = dot( texCoords[ 0 ], perp ) * globalUniform.liquidFlowScale *
+                            globalUniform.liquidFlowAspect;
+
+            // Procedural, full-range noise -- see d64_flowNoise for why the
+            // water normal map could not be the source. mod() is seamless
+            // because the lattice itself is 256-periodic.
+            float d = d64_flowNoise( vec2( mod( u, 256.0 ), v ) );
+
+            // shape into clots: plateaus of bright and dark with fast
+            // transitions, so what slides down the vein reads as blobs of
+            // liquid rather than as smooth static
+            d = smoothstep( 0.30, 0.70, d );
+
+            // nudged off zero so that EXACTLY 0 keeps meaning "no flow here"
+            liquidFlow = d * 0.998 + 0.001;
+        }
+    }
+#endif
+
 
     if( !stripNormals && tr.normalTexture != MATERIAL_NO_TEXTURE )
     {
@@ -654,7 +756,47 @@ ShHitInfo getHitInfoBounce(
             getTextureSampleLod( tr.emissiveTexture, texCoords[ 0 ], lod ).rgb;
     #endif
     #if defined( HITINFO_INL_INDIR )
-        emission *= tr.emissiveMult;
+        // Doom64-RT: a SCREEN_SCALED primitive's emissiveMult is what it LOOKS
+        // like; what it feeds the GI is a SEPARATE per-primitive value, because
+        // the two are animated on different clocks. The painted bulbs are held
+        // back to meet the light they cast (it arrives late through the
+        // denoiser history); the light itself must not be held back with them,
+        // or every frame of delay added to the bulbs moves the pool by the same
+        // amount and the gap never closes. A constant GI was tried in between
+        // and it was worse: the "real light turning" WAS this GI, so freezing
+        // it froze the chase. See RgMeshPrimitiveInfo::emissiveGi.
+        if( ( tr.geometryInstanceFlags & GEOM_INST_FLAG_EMIS_SCREEN_SCALED ) != 0 )
+        {
+            emission *= tr.emissiveMultGi;
+        }
+        else
+        {
+            emission *= tr.emissiveMult;
+        }
+    #else
+        // Doom64-RT: opt-in, so a fixture that is meant to SWITCH can.
+        //
+        // The rule above -- raw _e on screen, emissiveMult on the indirect path
+        // only -- means a caller can change how much a painted lamp feeds the GI
+        // and cannot change how bright it looks. For a fixture whose whole job is
+        // to turn on and off, that is the one thing it needs. MAP01's pre-exit
+        // pillar sweeps a light around four bulb panels; without this the painted
+        // bulbs stay lit through the entire cycle.
+        //
+        // One bit per primitive rather than a global change of the rule: every
+        // other emissive in the game was balanced against raw _e and must stay
+        // there. See RG_MESH_PRIMITIVE_EMISSIVE_SCREEN_SCALED.
+        //
+        // On screen, emissiveMult is applied AS IS. The GI above does not use
+        // it at all for these primitives; it uses the constant. That split is
+        // the whole point: the screen value is animated (a bulb switching) and
+        // the GI must not follow it, or the fixture's bounce light chases its
+        // own bulbs and the two can never be lined up -- every frame of delay
+        // added to the bulbs moved the pool of light back by the same amount.
+        if( ( tr.geometryInstanceFlags & GEOM_INST_FLAG_EMIS_SCREEN_SCALED ) != 0 )
+        {
+            emission *= tr.emissiveMult;
+        }
     #endif
     }
     else
